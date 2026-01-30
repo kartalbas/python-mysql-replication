@@ -28,6 +28,8 @@ def fetch_column_names(ctl_connection, schema, table, use_column_name_cache=Fals
     Centralized function used by both TableMapEvent and RowsEvent.
     Only caches successful non-empty results. Never caches failures.
 
+    Handles MySQL connection timeouts by attempting to reconnect and retry.
+
     Args:
         ctl_connection: MySQL control connection
         schema: Database schema name
@@ -48,36 +50,62 @@ def fetch_column_names(ctl_connection, schema, table, use_column_name_cache=Fals
     if cached:
         return cached
 
-    # Fetch from INFORMATION_SCHEMA
-    try:
-        query = """
-            SELECT COLUMN_NAME
-            FROM INFORMATION_SCHEMA.COLUMNS
-            WHERE TABLE_SCHEMA = %s AND TABLE_NAME = %s
-            ORDER BY ORDINAL_POSITION
-        """
-        cursor = ctl_connection.cursor()
-        cursor.execute(query, (schema, table))
-        rows = cursor.fetchall()
-        # Handle both tuple and dict cursor results
-        if rows and isinstance(rows[0], dict):
-            column_names = [row['COLUMN_NAME'] for row in rows]
-        else:
-            column_names = [row[0] for row in rows]
-        cursor.close()
+    query = """
+        SELECT COLUMN_NAME
+        FROM INFORMATION_SCHEMA.COLUMNS
+        WHERE TABLE_SCHEMA = %s AND TABLE_NAME = %s
+        ORDER BY ORDINAL_POSITION
+    """
 
-        # Only cache successful non-empty results
-        if column_names:
-            _COLUMN_NAME_CACHE[cache_key] = column_names
+    # Try up to 2 times (initial + retry after reconnect)
+    for attempt in range(2):
+        try:
+            # Ping to check/restore connection (handles wait_timeout disconnects)
+            if attempt == 0:
+                try:
+                    ctl_connection.ping(reconnect=True)
+                except Exception:
+                    pass  # ping failed, will try query anyway
+
+            cursor = ctl_connection.cursor()
+            cursor.execute(query, (schema, table))
+            rows = cursor.fetchall()
+            # Handle both tuple and dict cursor results
+            if rows and isinstance(rows[0], dict):
+                column_names = [row['COLUMN_NAME'] for row in rows]
+            else:
+                column_names = [row[0] for row in rows]
+            cursor.close()
+
+            # Only cache successful non-empty results
+            if column_names:
+                _COLUMN_NAME_CACHE[cache_key] = column_names
+                if enable_logging:
+                    logger.info(f"Cached column names for {cache_key}: {len(column_names)} columns")
+
+            return column_names
+
+        except Exception as e:
+            error_code = getattr(e, 'args', [None])[0] if hasattr(e, 'args') and e.args else None
+            is_connection_error = error_code in (2006, 2013) or 'gone away' in str(e).lower()
+
+            if is_connection_error and attempt == 0:
+                # Connection lost (wait_timeout) - try to reconnect
+                if enable_logging:
+                    logger.warning(f"Connection lost for {cache_key}, attempting reconnect: {type(e).__name__}")
+                try:
+                    ctl_connection.ping(reconnect=True)
+                    continue  # Retry the query
+                except Exception as reconnect_error:
+                    if enable_logging:
+                        logger.warning(f"Reconnect failed for {cache_key}: {type(reconnect_error).__name__}")
+
             if enable_logging:
-                logger.info(f"Cached column names for {cache_key}: {len(column_names)} columns")
+                logger.warning(f"Failed to fetch column names for {cache_key}: {type(e).__name__}: {e}")
+            # Don't cache failure - allow retry on next event
+            return []
 
-        return column_names
-    except Exception as e:
-        if enable_logging:
-            logger.warning(f"Failed to fetch column names for {cache_key}: {type(e).__name__}: {e}")
-        # Don't cache failure - allow retry on next event
-        return []
+    return []
 
 
 class RowsEvent(BinLogEvent):
