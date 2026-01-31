@@ -40,6 +40,8 @@ def fetch_column_names(ctl_connection, schema, table, use_column_name_cache=Fals
     Returns:
         list: Column names in ORDINAL_POSITION order, or empty list if disabled/failure
     """
+    import pymysql
+
     if not use_column_name_cache:
         return []
 
@@ -57,15 +59,63 @@ def fetch_column_names(ctl_connection, schema, table, use_column_name_cache=Fals
         ORDER BY ORDINAL_POSITION
     """
 
-    # Try up to 2 times (initial + retry after reconnect)
-    for attempt in range(2):
+    def is_connection_error(e):
+        """Check if exception indicates a dead/stale MySQL connection."""
+        error_code = getattr(e, 'args', [None])[0] if hasattr(e, 'args') and e.args else None
+        error_msg = str(e).lower()
+
+        # Known connection error codes
+        # 2006: MySQL server has gone away
+        # 2013: Lost connection to MySQL server
+        # 0: InterfaceError with dead socket (empty error)
+        if error_code in (0, 2006, 2013):
+            return True
+
+        # Check error message patterns
+        if 'gone away' in error_msg or 'lost connection' in error_msg:
+            return True
+
+        # InterfaceError typically means dead connection
+        if isinstance(e, pymysql.InterfaceError):
+            return True
+
+        return False
+
+    def force_reconnect(conn):
+        """Force reconnection by closing socket and calling connect()."""
+        logger.info(f"[COLUMN_FETCH] Force reconnect: closing socket and reconnecting for {cache_key}")
         try:
-            # Ping to check/restore connection (handles wait_timeout disconnects)
+            # Try to close existing connection cleanly
+            try:
+                if conn._sock:
+                    conn._sock.close()
+                    logger.debug(f"[COLUMN_FETCH] Socket closed for {cache_key}")
+            except Exception as close_err:
+                logger.debug(f"[COLUMN_FETCH] Socket close error (ignored): {type(close_err).__name__}")
+
+            # Reset internal state
+            conn._sock = None
+
+            # Reconnect
+            conn.connect()
+            logger.info(f"[COLUMN_FETCH] Force reconnect SUCCESS for {cache_key}")
+            return True
+        except Exception as reconnect_err:
+            logger.error(
+                f"[COLUMN_FETCH] Force reconnect FAILED for {cache_key}: "
+                f"{type(reconnect_err).__name__}: {reconnect_err}"
+            )
+            return False
+
+    # Try up to 3 times (initial + ping reconnect + force reconnect)
+    for attempt in range(3):
+        try:
+            # On first attempt, try ping to check/restore connection
             if attempt == 0:
                 try:
                     ctl_connection.ping(reconnect=True)
-                except Exception:
-                    pass  # ping failed, will try query anyway
+                except Exception as ping_err:
+                    logger.debug(f"[COLUMN_FETCH] Initial ping failed for {cache_key}: {type(ping_err).__name__}")
 
             cursor = ctl_connection.cursor()
             cursor.execute(query, (schema, table))
@@ -80,29 +130,60 @@ def fetch_column_names(ctl_connection, schema, table, use_column_name_cache=Fals
             # Only cache successful non-empty results
             if column_names:
                 _COLUMN_NAME_CACHE[cache_key] = column_names
-                if enable_logging:
-                    logger.info(f"Cached column names for {cache_key}: {len(column_names)} columns")
+                if attempt > 0:
+                    # Log recovery success if we had to retry
+                    logger.info(
+                        f"[COLUMN_FETCH] RECOVERED after {attempt + 1} attempts for {cache_key}: "
+                        f"{len(column_names)} columns fetched"
+                    )
+                elif enable_logging:
+                    logger.info(f"[COLUMN_FETCH] Cached column names for {cache_key}: {len(column_names)} columns")
 
             return column_names
 
         except Exception as e:
             error_code = getattr(e, 'args', [None])[0] if hasattr(e, 'args') and e.args else None
-            is_connection_error = error_code in (2006, 2013) or 'gone away' in str(e).lower()
 
-            if is_connection_error and attempt == 0:
-                # Connection lost (wait_timeout) - try to reconnect
-                if enable_logging:
-                    logger.warning(f"Connection lost for {cache_key}, attempting reconnect: {type(e).__name__}")
+            if not is_connection_error(e):
+                # Not a connection error - don't retry
+                logger.warning(
+                    f"[COLUMN_FETCH] Non-connection error for {cache_key}: "
+                    f"{type(e).__name__}: {e}"
+                )
+                return []
+
+            logger.warning(
+                f"[COLUMN_FETCH] Connection error for {cache_key} (attempt {attempt + 1}/3): "
+                f"{type(e).__name__} (code={error_code}): {e}"
+            )
+
+            if attempt == 0:
+                # First failure - try ping reconnect
+                logger.info(f"[COLUMN_FETCH] Attempting ping reconnect for {cache_key}...")
                 try:
                     ctl_connection.ping(reconnect=True)
+                    logger.info(f"[COLUMN_FETCH] Ping reconnect SUCCESS for {cache_key}, retrying query...")
                     continue  # Retry the query
-                except Exception as reconnect_error:
-                    if enable_logging:
-                        logger.warning(f"Reconnect failed for {cache_key}: {type(reconnect_error).__name__}")
+                except Exception as ping_err:
+                    logger.warning(
+                        f"[COLUMN_FETCH] Ping reconnect FAILED for {cache_key}: "
+                        f"{type(ping_err).__name__}: {ping_err}"
+                    )
+                    # Will try force_reconnect on next iteration
 
-            if enable_logging:
-                logger.warning(f"Failed to fetch column names for {cache_key}: {type(e).__name__}: {e}")
-            # Don't cache failure - allow retry on next event
+            elif attempt == 1:
+                # Second failure (ping didn't help) - try force reconnect
+                logger.info(f"[COLUMN_FETCH] Ping failed, attempting force reconnect for {cache_key}...")
+                if force_reconnect(ctl_connection):
+                    logger.info(f"[COLUMN_FETCH] Force reconnect succeeded, retrying query...")
+                    continue  # Retry the query
+                # Force reconnect also failed - give up
+
+            # All reconnection attempts failed
+            logger.error(
+                f"[COLUMN_FETCH] ALL RECONNECTION ATTEMPTS FAILED for {cache_key}. "
+                f"Column names will be UNKNOWN_COL*. This will trigger Layer 2 recovery (stream restart)."
+            )
             return []
 
     return []
